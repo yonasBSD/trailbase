@@ -3,6 +3,9 @@ pub enum Error {
   #[error("ConnectionClosed")]
   ConnectionClosed,
 
+  #[error("NotSupported")]
+  NotSupported,
+
   /// Error when the value of a particular column is requested, but the type
   /// of the result in that column cannot be converted to the requested
   /// Rust type.
@@ -20,6 +23,12 @@ pub enum Error {
   // rusqlite::Error. Otherwise, should/could this be more opaue.
   #[error("Rusqlite: {0}")]
   Rusqlite(#[from] rusqlite::Error),
+
+  // QUESTION: This is leaky. How often do downstream users have to introspect on this
+  // rusqlite::Error. Otherwise, should/could this be more opaue.
+  #[cfg(feature = "pg")]
+  #[error("Posgres: {0}")]
+  Postgres(#[from] postgres::Error),
 
   #[error("DeserializeValue: {0}")]
   DeserializeValue(serde_rusqlite::Error),

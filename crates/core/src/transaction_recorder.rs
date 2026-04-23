@@ -4,7 +4,7 @@ use std::{
   path::{Path, PathBuf},
 };
 use thiserror::Error;
-use trailbase_sqlite::SyncConnectionTrait;
+use trailbase_sqlite::traits::{SyncConnection, SyncTransaction};
 
 use crate::migrations;
 
@@ -92,7 +92,7 @@ impl TransactionLog {
     conn: &trailbase_sqlite::Connection,
   ) -> Result<(), trailbase_sqlite::Error> {
     conn
-      .transaction(|tx| -> Result<(), trailbase_sqlite::Error> {
+      .transaction(|mut tx| -> Result<(), trailbase_sqlite::Error> {
         for (query_type, stmt) in self.log {
           match query_type {
             QueryType::Query => {

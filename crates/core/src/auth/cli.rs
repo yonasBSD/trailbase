@@ -1,6 +1,7 @@
 use base64::prelude::*;
 use const_format::formatcp;
-use trailbase_sqlite::{Connection, SyncConnectionTrait, params};
+use trailbase_sqlite::traits::{SyncConnection, SyncTransaction};
+use trailbase_sqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::DataDir;
@@ -215,7 +216,7 @@ pub async fn import_users(
   }
 
   user_conn
-    .transaction(|tx| -> Result<(), trailbase_sqlite::Error> {
+    .transaction(|mut tx| -> Result<(), trailbase_sqlite::Error> {
       const IMPORT_USER_QUERY: &str = formatcp!(
         "INSERT INTO '{USER_TABLE}' (email, password_hash, verified) VALUES (?1, ?2, ?3)"
       );

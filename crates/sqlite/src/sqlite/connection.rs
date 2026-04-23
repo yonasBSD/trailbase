@@ -9,9 +9,10 @@ use crate::from_sql::FromSql;
 use crate::params::Params;
 use crate::rows::{Row, Rows};
 use crate::sqlite::executor::Executor;
-use crate::sqlite::sync::{SyncConnection, SyncConnectionTrait};
+use crate::sqlite::sync::SyncConnection;
 use crate::sqlite::transaction::Transaction;
 use crate::sqlite::util::{columns, from_row, from_rows, get_value, map_first};
+use crate::traits::SyncConnection as SyncConnectionTrait;
 
 // NOTE: We should probably decouple from the impl.
 pub use crate::sqlite::executor::{ArcLockGuard, LockError, LockGuard, Options};
@@ -118,16 +119,6 @@ impl Connection {
       .await;
   }
 
-  // pub async fn call_reader<F, R, E>(&self, function: F) -> Result<R, Error>
-  // where
-  //   F: FnOnce(&rusqlite::Connection) -> Result<R, E> + Send + 'static,
-  //   R: Send + 'static,
-  //   E: Send + 'static,
-  //   Error: From<E>,
-  // {
-  //   return self.exec.call_reader(function).await;
-  // }
-
   /// Transactions
   ///
   /// Note: we us an async API rather than a sync blocking API, e.g.:
@@ -146,7 +137,7 @@ impl Connection {
       .exec
       .call_writer::<_, R, Error>(move |conn: &mut rusqlite::Connection| {
         let tx = conn.transaction()?;
-        return Ok(function(Transaction::new(tx))?);
+        return Ok(function(Transaction { tx })?);
       })
       .await;
   }
@@ -320,7 +311,7 @@ impl Connection {
       .await;
   }
 
-  pub fn attach(&self, path: &str, name: &str) -> Result<(), Error> {
+  pub async fn attach(&self, path: &str, name: &str) -> Result<(), Error> {
     let query = format!("ATTACH DATABASE '{path}' AS {name} ");
     return self.exec.map(move |conn| {
       conn.execute(&query, ())?;
@@ -328,7 +319,7 @@ impl Connection {
     });
   }
 
-  pub fn detach(&self, name: &str) -> Result<(), Error> {
+  pub async fn detach(&self, name: &str) -> Result<(), Error> {
     let query = format!("DETACH DATABASE {name}");
     return self.exec.map(move |conn| {
       conn.execute(&query, ())?;

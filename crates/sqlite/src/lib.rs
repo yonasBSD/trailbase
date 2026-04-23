@@ -14,15 +14,17 @@ mod connection;
 mod database;
 mod error;
 pub mod from_sql;
+mod generic;
 mod params;
 mod rows;
 pub mod sqlite;
 mod statement;
 pub mod to_sql;
+pub mod traits;
 mod value;
 
-#[cfg(debug_assertions)]
-mod experimental;
+#[cfg(feature = "pg")]
+mod pg;
 
 pub use connection::{
   ArcLockGuard, Connection, LockError, LockGuard, Options, SyncConnection, SyncConnectionTrait,

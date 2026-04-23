@@ -2,7 +2,6 @@ use rusqlite::hooks::PreUpdateCase;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::SyncConnectionTrait;
 use crate::database::Database;
 use crate::error::Error;
 use crate::from_sql::{FromSql, FromSqlError};
@@ -55,7 +54,7 @@ pub fn from_rows(mut rows: rusqlite::Rows) -> Result<Rows, Error> {
   return Ok(Rows(result, columns));
 }
 
-pub(super) fn from_row(row: &rusqlite::Row, cols: Arc<Vec<Column>>) -> Result<Row, Error> {
+pub(crate) fn from_row(row: &rusqlite::Row, cols: Arc<Vec<Column>>) -> Result<Row, Error> {
   #[cfg(debug_assertions)]
   if let Some(rc) = Some(columns(row.as_ref()))
     && rc.len() != cols.len()
@@ -75,7 +74,7 @@ pub(super) fn from_row(row: &rusqlite::Row, cols: Arc<Vec<Column>>) -> Result<Ro
 }
 
 #[inline]
-pub(super) fn columns(stmt: &rusqlite::Statement<'_>) -> Vec<Column> {
+pub(crate) fn columns(stmt: &rusqlite::Statement<'_>) -> Vec<Column> {
   return stmt
     .columns()
     .into_iter()
@@ -132,16 +131,17 @@ pub fn extract_record_values(case: &PreUpdateCase) -> Option<Vec<Value>> {
   });
 }
 
-pub fn list_databases(conn: &impl SyncConnectionTrait) -> Result<Vec<Database>, Error> {
-  let rows = conn.query_rows("SELECT seq, name FROM pragma_database_list", ())?;
+pub(crate) fn list_databases(conn: &rusqlite::Connection) -> Result<Vec<Database>, Error> {
+  let mut stmt = conn.prepare_cached("SELECT seq, name FROM pragma_database_list")?;
+  let mut rows = stmt.raw_query();
 
-  return rows
-    .iter()
-    .map(|row| {
-      return Ok(Database {
-        seq: row.get(0)?,
-        name: row.get(1)?,
-      });
-    })
-    .collect::<Result<Vec<_>, _>>();
+  let mut dbs = vec![];
+  while let Some(row) = rows.next()? {
+    dbs.push(Database {
+      seq: row.get(0)?,
+      name: row.get(1)?,
+    });
+  }
+
+  return Ok(dbs);
 }

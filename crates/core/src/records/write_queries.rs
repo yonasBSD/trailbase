@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use trailbase_schema::QualifiedNameEscaped;
+use trailbase_sqlite::traits::SyncTransaction;
 use trailbase_sqlite::{Connection, NamedParams, Value};
 
 use crate::config::proto::ConflictResolutionStrategy;
@@ -167,7 +168,7 @@ impl WriteQuery {
 
   pub(super) fn apply_sync(
     self,
-    conn: &impl trailbase_sqlite::SyncConnectionTrait,
+    conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
   ) -> Result<WriteQueryResult, trailbase_sqlite::Error> {
     return match self {
       Self::Insert {
@@ -249,10 +250,10 @@ pub(crate) async fn run_queries(
   };
 
   let result: Vec<WriteQueryResult> = conn
-    .transaction(move |tx| -> Result<_, trailbase_sqlite::Error> {
+    .transaction(move |mut tx| -> Result<_, trailbase_sqlite::Error> {
       let rows: Vec<WriteQueryResult> = queries
         .into_iter()
-        .map(|query| query.apply_sync(&tx))
+        .map(|query| query.apply_sync(&mut tx))
         .collect::<Result<Vec<_>, _>>()?;
 
       tx.commit()?;
