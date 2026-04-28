@@ -91,7 +91,7 @@ impl ConnectionManager {
   ) -> Result<(Self, bool), ConnectionError> {
     let (main_conn, main_metadata, new_db) = init_main_db_impl(
       Some(&data_dir),
-      Some(json_schema_registry.clone()),
+      json_schema_registry.clone(),
       vec![],
       sqlite_function_runtimes.clone(),
       true,
@@ -122,7 +122,7 @@ impl ConnectionManager {
   ) -> Self {
     let (main_conn, main_metadata, new_db) = init_main_db_impl(
       None,
-      Some(json_schema_registry.clone()),
+      json_schema_registry.clone(),
       vec![],
       sqlite_function_runtimes.clone(),
       true,
@@ -223,7 +223,7 @@ impl ConnectionManager {
 
     let (conn, metadata, _new_db) = init_main_db_impl(
       Some(&self.state.data_dir),
-      Some(self.state.json_schema_registry.clone()),
+      self.state.json_schema_registry.clone(),
       attach,
       self.state.sqlite_function_runtimes.clone(),
       main,
@@ -266,27 +266,9 @@ impl ConnectionManager {
   }
 }
 
-/// Initializes a new SQLite Connection with all the default extensions, migrations and settings
-/// applied.
-///
-/// Returns a Connection and whether the DB was newly created..
-pub fn init_main_db(
-  data_dir: Option<&DataDir>,
-  json_registry: Option<Arc<RwLock<JsonSchemaRegistry>>>,
-  attached_databases: Vec<AttachedDatabase>,
-  runtimes: Vec<(SqliteStore, SqliteFunctions)>,
-) -> Result<(Connection, ConnectionMetadata, bool), ConnectionError> {
-  // SQLite supports only up to 125 DBs per connection: https://sqlite.org/limits.html.
-  if attached_databases.len() > 124 {
-    return Err(ConnectionError::Other("Too many databases".into()));
-  }
-
-  return init_main_db_impl(data_dir, json_registry, attached_databases, runtimes, true);
-}
-
 fn init_main_db_impl(
   data_dir: Option<&DataDir>,
-  json_registry: Option<Arc<RwLock<JsonSchemaRegistry>>>,
+  json_registry: Arc<RwLock<JsonSchemaRegistry>>,
   attach: Vec<AttachedDatabase>,
   runtimes: Vec<(SqliteStore, SqliteFunctions)>,
   main_migrations: bool,
@@ -301,7 +283,7 @@ fn init_main_db_impl(
       // NOTE: that migrations may also depend on extension functions.
       // FIXME: Right now this will fail if user migrations depend on custom WASM SQLite functions.
       let mut secondary =
-        trailbase_extension::connect_sqlite(Some(path.clone()), json_registry.clone())?;
+        trailbase_extension::connect_sqlite(Some(path.clone()), Some(json_registry.clone()))?;
 
       // The default is just 16.
       secondary.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
@@ -321,8 +303,9 @@ fn init_main_db_impl(
     let new_db = &mut new_db;
 
     let conn_builder = move || -> Result<_, trailbase_sqlite::Error> {
-      let mut conn = trailbase_extension::connect_sqlite(main_path.clone(), json_registry.clone())
-        .map_err(|err| trailbase_sqlite::Error::Other(err.into()))?;
+      let mut conn =
+        trailbase_extension::connect_sqlite(main_path.clone(), Some(json_registry.clone()))
+          .map_err(|err| trailbase_sqlite::Error::Other(err.into()))?;
 
       // The default is just 16.
       conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
@@ -359,11 +342,6 @@ fn init_main_db_impl(
       {
         let mut lock = metadata.lock();
         if lock.is_none() {
-          let json_registry = json_registry.as_ref().map_or_else(
-            || Arc::new(RwLock::new(JsonSchemaRegistry::default())),
-            |r| r.clone(),
-          );
-
           let _ = lock.insert(
             build_metadata_sync(&conn, &json_registry)
               .map_err(|err| trailbase_sqlite::Error::Other(err.into()))?,

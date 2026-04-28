@@ -139,11 +139,17 @@ async fn async_main(
       println!("Created empty migration file: {path:?}");
     }
     SubCommands::Admin { cmd } => {
-      let (conn, _metadata, _new) = api::init_main_db(Some(&data_dir), None, vec![], vec![])?;
+      let (_new_db, state) = init_app_state(InitArgs {
+        data_dir,
+        public_url,
+        ..Default::default()
+      })
+      .await?;
 
       match cmd {
         Some(AdminSubCommands::List) => {
-          let users = conn
+          let users = state
+            .user_conn()
             .read_query_values::<DbUser>(format!("SELECT * FROM {USER_TABLE} WHERE admin > 0"), ())
             .await?;
 
@@ -160,11 +166,13 @@ async fn async_main(
           }
         }
         Some(AdminSubCommands::Demote { user }) => {
-          let id = api::cli::demote_admin_to_user(&conn, to_user_reference(user)).await?;
+          let id =
+            api::cli::demote_admin_to_user(state.user_conn(), to_user_reference(user)).await?;
           println!("Demoted admin to user for '{id}'");
         }
         Some(AdminSubCommands::Promote { user }) => {
-          let id = api::cli::promote_user_to_admin(&conn, to_user_reference(user)).await?;
+          let id =
+            api::cli::promote_user_to_admin(state.user_conn(), to_user_reference(user)).await?;
           println!("Promoted user to admin for '{id}'");
         }
         None => {
@@ -175,41 +183,51 @@ async fn async_main(
       };
     }
     SubCommands::User { cmd } => {
-      let (user_conn, _metadata, _new) = api::init_main_db(Some(&data_dir), None, vec![], vec![])?;
-      let session_conn = api::init_session_db(Some(&data_dir))?;
+      let (_new_db, state) = init_app_state(InitArgs {
+        data_dir,
+        public_url,
+        ..Default::default()
+      })
+      .await?;
 
       match cmd {
         Some(UserSubCommands::ChangePassword { user, password }) => {
-          let id =
-            api::cli::change_password(&user_conn, to_user_reference(user), &password).await?;
+          let id = api::cli::change_password(state.user_conn(), to_user_reference(user), &password)
+            .await?;
           println!("Updated password for '{id}'");
         }
         Some(UserSubCommands::ChangeEmail { user, new_email }) => {
-          let id = api::cli::change_email(&user_conn, to_user_reference(user), &new_email).await?;
+          let id =
+            api::cli::change_email(state.user_conn(), to_user_reference(user), &new_email).await?;
           println!("Updated email for '{id}'");
         }
         Some(UserSubCommands::Add { email, password }) => {
-          api::cli::add_user(&user_conn, &email, &password).await?;
+          api::cli::add_user(state.user_conn(), &email, &password).await?;
           println!("Added user '{email}'");
         }
         Some(UserSubCommands::Delete { user }) => {
-          api::cli::delete_user(&user_conn, to_user_reference(user.clone())).await?;
+          api::cli::delete_user(state.user_conn(), to_user_reference(user.clone())).await?;
           println!("Deleted user '{user}'");
         }
         Some(UserSubCommands::Verify { user, verified }) => {
-          let id = api::cli::set_verified(&user_conn, to_user_reference(user), verified).await?;
+          let id =
+            api::cli::set_verified(state.user_conn(), to_user_reference(user), verified).await?;
           println!("Set verified={verified} for '{id}'");
         }
         Some(UserSubCommands::InvalidateSession { user }) => {
-          api::cli::invalidate_sessions(&user_conn, &session_conn, to_user_reference(user.clone()))
-            .await?;
+          api::cli::invalidate_sessions(
+            state.user_conn(),
+            state.session_conn(),
+            to_user_reference(user.clone()),
+          )
+          .await?;
           println!("Sessions invalidated for '{user}'");
         }
         Some(UserSubCommands::MintToken { user }) => {
           let auth_token = api::cli::mint_auth_token(
-            &data_dir,
-            &user_conn,
-            &session_conn,
+            state.data_dir(),
+            state.user_conn(),
+            state.session_conn(),
             to_user_reference(user.clone()),
           )
           .await?;
@@ -226,7 +244,7 @@ async fn async_main(
             println!("Importing {} users.", users.len());
 
             if !dry_run {
-              api::cli::import_users(&user_conn, users).await?;
+              api::cli::import_users(state.user_conn(), users).await?;
             }
           } else {
             return Err("Missing '--auth0_json' path".into());
