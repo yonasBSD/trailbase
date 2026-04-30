@@ -1,3 +1,13 @@
+## v0.26.8
+
+- Add two new SQL connection types: a postgres one and a polymorphic one with runtime dispatch.
+  - This is mostly a proof-of-concept. Tests pass with the polymorphic connection pointing at SQLite but using postgres entails many more challenges:
+    - Different SQL dialects.
+    - Schema extraction missing.
+    - Change notifications for RecordApi subscriptions work very differently.
+- Introduce a new `AsyncReactive` + snapshot primitive to further entangle DB connection establishment from the execution model, i.e. allow establishing connection asynchronously and thus `RecordApi`s.
+- Update dependencies.
+
 ## v0.26.7
 
 - Fix CLI regression for `user` and `admin` commands due to DB initialization order changes.
