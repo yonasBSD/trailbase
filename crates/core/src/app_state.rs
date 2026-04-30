@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use trailbase_extension::jsonschema::JsonSchemaRegistry;
-use trailbase_reactive::Reactive;
+use trailbase_reactive::{AsyncReactive, DeriveInput, Reactive};
 use trailbase_schema::QualifiedName;
 
 use crate::auth::jwt::JwtHelper;
@@ -50,7 +50,7 @@ struct InternalState {
 
   jwt: JwtHelper,
 
-  record_apis: Reactive<HashMap<String, RecordApi>>,
+  record_apis: AsyncReactive<HashMap<String, RecordApi>>,
   subscription_manager: SubscriptionManager,
   object_store: Arc<dyn ObjectStore>,
 
@@ -87,7 +87,7 @@ pub struct AppState {
 }
 
 impl AppState {
-  pub(crate) fn new(args: AppStateArgs) -> Self {
+  pub(crate) async fn new(args: AppStateArgs) -> Self {
     let config = Reactive::new(args.config);
 
     let public_url = args.public_url.clone();
@@ -111,7 +111,8 @@ impl AppState {
     let record_apis = build_record_apis(
       args.connection_manager.clone(),
       config.derive(|c| c.record_apis.clone()),
-    );
+    )
+    .await;
 
     let main_conn = args.connection_manager.main_entry().connection;
     let object_store: Arc<dyn ObjectStore> = args.object_store.into();
@@ -271,7 +272,7 @@ impl AppState {
     self.state.connection_manager.rebuild_metadata().await?;
 
     // Rebuild connection metadata in RecordApis.
-    for api in self.state.record_apis.ptr().values() {
+    for api in self.state.record_apis.ptr().await.values() {
       api
         .rebuild_connection_metadata(&self.state.json_schema_registry)
         .await?;
@@ -283,10 +284,12 @@ impl AppState {
     // happened rendering the current config invalid. Unlike a config update, it's too late to
     // reject anything.
     let config = self.get_config();
-    validate_config(&self.state.connection_manager, &config).map_err(|err| {
-      log::error!("Schema change invalidated config: {err}");
-      return crate::schema_metadata::SchemaLookupError::Other(err.into());
-    })?;
+    validate_config(&self.state.connection_manager, &config)
+      .await
+      .map_err(|err| {
+        log::error!("Schema change invalidated config: {err}");
+        return crate::schema_metadata::SchemaLookupError::Other(err.into());
+      })?;
 
     return Ok(());
   }
@@ -316,11 +319,7 @@ impl AppState {
   }
 
   pub fn lookup_record_api(&self, name: &str) -> Option<RecordApi> {
-    let mut r: Option<RecordApi> = None;
-    self.state.record_apis.with_value(|apis| {
-      r = apis.get(name).cloned();
-    });
-    return r;
+    return self.state.record_apis.snapshot().get(name).cloned();
   }
 
   pub fn get_config(&self) -> Arc<Config> {
@@ -340,7 +339,7 @@ impl AppState {
     hash: Option<String>,
   ) -> Result<(), ConfigError> {
     let connection_manager = self.connection_manager();
-    validate_config(&connection_manager, &config)?;
+    validate_config(&connection_manager, &config).await?;
 
     match hash {
       Some(hash) => {
@@ -379,7 +378,11 @@ impl AppState {
     }
 
     // Write new config to the file system.
-    return write_config_and_vault_textproto(self.data_dir(), &connection_manager, &new_config);
+    write_config_and_vault_textproto(self.data_dir(), &connection_manager, &new_config).await?;
+
+    let _wait_for_snapshot_update = self.state.record_apis.ptr().await;
+
+    return Ok(());
   }
 
   pub(crate) fn wasm_runtimes(&self) -> &[Arc<RwLock<Runtime>>] {
@@ -558,7 +561,8 @@ pub async fn test_state(options: Option<TestStateOptions>) -> anyhow::Result<App
   let record_apis = build_record_apis(
     connection_manager.clone(),
     config.derive(|c| c.record_apis.clone()),
-  );
+  )
+  .await;
 
   return Ok(AppState {
     state: Arc::new(InternalState {
@@ -592,95 +596,82 @@ pub async fn test_state(options: Option<TestStateOptions>) -> anyhow::Result<App
   });
 }
 
-fn build_record_apis(
+async fn build_record_apis(
   connection_manager: ConnectionManager,
   record_api_configs: Reactive<Vec<RecordApiConfig>>,
-) -> Reactive<HashMap<String, RecordApi>> {
-  let record_apis: Reactive<HashMap<String, RecordApi>> = Reactive::new(
-    record_api_configs
-      .value()
-      .into_iter()
-      .map(|config| {
+) -> AsyncReactive<HashMap<String, RecordApi>> {
+  let derived = record_api_configs.derive_unchecked_async(move |DeriveInput { prev, dep }| {
+    let connection_manager = connection_manager.clone();
+    let configs: Arc<Vec<RecordApiConfig>> = dep.clone();
+    let prev = prev.cloned();
+
+    // Re-use existing connection when possible to keep subscriptions alive.
+    //
+    // WARN: We need to be very careful to how we rebuild RecordAPIs, since long-lived
+    // subscriptions may be tied to specific connections. So we need to keep connection alive
+    // whenever possible, e.g. an ACL changing for one API isn't a good reason to drop
+    // subscriptions on all APIs.
+    let get_conn =
+      async move |api_name: &str, attached_databases: &[String]| -> Result<_, ConnectionError> {
+        if let Some((_, candidate)) =
+          prev
+            .as_ref()
+            .and_then(|prev: &Arc<HashMap<String, RecordApi>>| {
+              return prev.iter().find(|(_name, api)| api.api_name() == api_name);
+            })
+          && candidate.attached_databases() == attached_databases
+        {
+          return Ok((
+            candidate.conn().clone(),
+            candidate.connection_metadata().clone(),
+          ));
+        };
+
         let ConnectionEntry {
           connection: conn,
           metadata,
-        } = if config.attached_databases.is_empty() {
+        } = if attached_databases.is_empty() {
           connection_manager.main_entry()
         } else {
           connection_manager
-            .get_entry(
-              true,
-              Some(config.attached_databases.iter().cloned().collect()),
-            )
-            .map_err(|err| err.to_string())
-            .expect("startup")
+            .get_entry(true, Some(attached_databases.iter().cloned().collect()))
+            .await?
         };
 
-        let api = build_record_api(conn, metadata, config).expect("startup");
-        return (api.api_name().to_string(), api);
-      })
-      .collect(),
-  );
+        return Ok((conn, metadata));
+      };
 
-  // Rebuild RecordApi instances when config changes.
-  //
-  // WARN: We need to be very careful to how we rebuild RecordAPIs, since long-lived
-  // subscriptions may be tied to specific connections. So we need to keep connection alive
-  // whenever possible, e.g. an ACL changing for one API isn't a good reason to drop
-  // subscriptions on all APIs.
-  {
-    let record_apis = record_apis.clone();
-    record_api_configs.add_observer(move |record_api_configs| {
-      record_apis.update_unchecked(|old| {
-        // Re-use existing connection when possible to keep subscriptions alive.
-        let get_conn =
-          |api_name: &str, attached_databases: &[String]| -> Result<_, ConnectionError> {
-            if let Some((_, candidate)) = old.iter().find(|(_name, api)| api.api_name() == api_name)
-              && candidate.attached_databases() == attached_databases
-            {
-              return Ok((
-                candidate.conn().clone(),
-                candidate.connection_metadata().clone(),
-              ));
-            };
+    return Box::pin(async move {
+      let mut next: HashMap<String, RecordApi> = HashMap::new();
 
-            let ConnectionEntry {
-              connection: conn,
-              metadata,
-            } = if attached_databases.is_empty() {
-              connection_manager.main_entry()
-            } else {
-              connection_manager
-                .get_entry(true, Some(attached_databases.iter().cloned().collect()))?
-            };
+      for config in configs.iter() {
+        let (conn, metadata) = match get_conn(config.name(), &config.attached_databases).await {
+          Ok(x) => x,
+          Err(err) => {
+            log::error!("Failed to get conn for record API {}: {err}", config.name());
+            continue;
+          }
+        };
 
-            return Ok((conn, metadata));
-          };
+        match build_record_api(conn, metadata, config.clone()) {
+          Ok(api) => {
+            next.insert(api.api_name().to_string(), api);
+          }
+          Err(err) => {
+            log::error!("Failed to build record API {}: {err}", config.name());
+          }
+        };
+      }
 
-        return record_api_configs
-          .iter()
-          .filter_map(|config| {
-            let (conn, metadata) = get_conn(config.name(), &config.attached_databases)
-              .map_err(|err| {
-                log::error!("Failed to get conn for record API {}: {err}", config.name());
-                return err;
-              })
-              .ok()?;
-
-            return match build_record_api(conn, metadata, config.clone()) {
-              Ok(api) => Some((api.api_name().to_string(), api)),
-              Err(err) => {
-                log::error!("Failed to build record API {}: {err}", config.name());
-                None
-              }
-            };
-          })
-          .collect();
-      });
+      return next;
     });
-  }
+  });
 
-  return record_apis;
+  // Give the snapshot a chance to update, otherwise `derived.snapshot()` will return only the
+  // default empty map.
+  let _make_sure_snapshot_is_valid = derived.ptr().await;
+
+  return derived;
 }
 
 fn build_record_api(
