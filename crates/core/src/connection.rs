@@ -9,7 +9,7 @@ use thiserror::Error;
 use trailbase_extension::jsonschema::JsonSchemaRegistry;
 use trailbase_schema::metadata::ConnectionMetadata;
 
-pub use trailbase_sqlite::Connection;
+pub use trailbase_sqlite::{Connection, unpack_other_error};
 
 use crate::data_dir::DataDir;
 use crate::migrations::{
@@ -37,6 +37,13 @@ pub enum ConnectionError {
   // Used during runtime config/schema reloads.
   #[error("ConfigError: {0}")]
   ConfigError(#[from] crate::config::ConfigError),
+}
+
+// Packaging helper.
+impl From<ConnectionError> for trailbase_sqlite::Error {
+  fn from(err: ConnectionError) -> Self {
+    return trailbase_sqlite::Error::Other(err.into());
+  }
 }
 
 pub struct AttachedDatabase {
@@ -283,85 +290,93 @@ async fn init_main_db_impl(
     return Err(ConnectionError::InvalidSetting("Too many databases"));
   }
 
+  fn build_connection(
+    db_path: Option<PathBuf>,
+    json_registry: Arc<RwLock<JsonSchemaRegistry>>,
+    runtimes: &Vec<(SqliteStore, SqliteFunctions)>,
+  ) -> Result<rusqlite::Connection, ConnectionError> {
+    let conn = trailbase_extension::connect_sqlite(db_path, Some(json_registry))?;
+
+    // Apply custom connection settings, e.g. pragmas and client settings.
+    {
+      // The default is just 16.
+      conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+
+      // NOTE: We could consider larger memory maps and caches for the main database.
+      // Should be driven by benchmarks.
+      // conn.pragma_update(None, "mmap_size", 268435456)?;
+      // conn.pragma_update(None, "cache_size", -32768)?; // 32MB
+    }
+
+    #[cfg(any(feature = "geos", feature = "geos-static"))]
+    litegis::register(&conn).map_err(trailbase_extension::Error::Rusqlite)?;
+
+    // Install SQLite extension methods/functions registered by WASM components.
+    #[cfg(feature = "wasm")]
+    for (store, functions) in runtimes {
+      trailbase_wasm_runtime_host::functions::setup_connection(&conn, store.clone(), functions)
+        .map_err(trailbase_extension::Error::Rusqlite)?;
+    }
+
+    return Ok(conn);
+  }
+
   let main_path = data_dir.map(|d| d.main_db_path());
   let migrations_path = data_dir.map(|d| d.migrations_path());
 
   let mut new_db = AtomicBool::new(false);
 
-  let conn = {
-    let new_db = &mut new_db;
-    let json_registry = json_registry.clone();
-    let migrations_path = migrations_path.clone();
+  let conn = trailbase_sqlite::Connection::with_opts(
+    {
+      let new_db = &mut new_db;
+      let json_registry = json_registry.clone();
+      let migrations_path = migrations_path.clone();
+      let runtimes = runtimes.clone();
 
-    let conn_builder = move || -> Result<_, trailbase_sqlite::Error> {
-      let mut conn =
-        trailbase_extension::connect_sqlite(main_path.clone(), Some(json_registry.clone()))
-          .map_err(|err| trailbase_sqlite::Error::Other(err.into()))?;
+      move || -> Result<rusqlite::Connection, ConnectionError> {
+        let mut conn = build_connection(main_path.clone(), json_registry.clone(), &runtimes)?;
 
-      #[cfg(any(feature = "geos", feature = "geos-static"))]
-      litegis::register(&conn).map_err(|err| trailbase_sqlite::Error::Other(err.into()))?;
+        // Apply migrations.
+        //
+        // IMPORTANT: All extensions need to be loaded before to satisfy potential dependencies.
+        if main_migrations {
+          new_db.fetch_or(
+            apply_main_migrations(&mut conn, migrations_path.as_ref())
+              .map_err(|err| trailbase_sqlite::Error::Other(err.into()))?,
+            Ordering::SeqCst,
+          );
+        }
 
-      // Apply custom connection settings, e.g. pragmas and client settings.
-      {
-        // The default is just 16.
-        conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
-
-        // NOTE: We could consider larger memory maps and caches for the main database.
-        // Should be driven by benchmarks.
-        // conn.pragma_update(None, "mmap_size", 268435456)?;
-        // conn.pragma_update(None, "cache_size", -32768)?; // 32MB
+        return Ok(conn);
       }
-
-      // Apply migrations. Extensions need to be loaded before to satisfy potential
-      // dependencies.
-      if main_migrations {
-        new_db.fetch_or(
-          apply_main_migrations(&mut conn, migrations_path.as_ref())
-            .map_err(|err| trailbase_sqlite::Error::Other(err.into()))?,
-          Ordering::SeqCst,
-        );
-      }
-
-      // Install SQLite extension methods/functions registered by WASM components.
-      #[cfg(feature = "wasm")]
-      for (store, functions) in &runtimes {
-        trailbase_wasm_runtime_host::functions::setup_connection(&conn, store.clone(), functions)
-          .expect("startup");
-      }
-
-      return Ok(conn);
-    };
-
-    trailbase_sqlite::Connection::with_opts(
-      conn_builder,
-      trailbase_sqlite::Options {
-        num_threads: match (data_dir, std::thread::available_parallelism()) {
-          (None, _) => Some(1),
-          (Some(_), Ok(n)) => Some(n.get().clamp(2, 4)),
-          (Some(_), Err(_)) => Some(2),
-        },
-        ..Default::default()
+    },
+    trailbase_sqlite::Options {
+      num_threads: match (data_dir, std::thread::available_parallelism()) {
+        (None, _) => Some(1),
+        (Some(_), Ok(n)) => Some(n.get().clamp(2, 4)),
+        (Some(_), Err(_)) => Some(2),
       },
-    )?
-  };
+      ..Default::default()
+    },
+  )
+  .map_err(|err| {
+    // Unpack potentially packed ConnectionError.
+    return match unpack_other_error::<ConnectionError>(err) {
+      Ok(schema_lookup_err) => schema_lookup_err,
+      Err(sql_err) => sql_err.into(),
+    };
+  })?;
 
   for AttachedDatabase { schema_name, path } in &attach {
     debug!("Attaching '{schema_name}': {path:?}, {migrations_path:?}");
 
-    // First make sure, DB is an up-to-date state.
-    //
-    // NOTE: We do need extensions, since migrations may depend on them.
+    // Before attaching secondary DBs, we must ensure their schemas are up-to-date.
     if let Some(ref migrations_path) = migrations_path {
-      // NOTE: that migrations may also depend on extension functions.
-      // FIXME: Right now this will fail if user migrations depend on custom WASM SQLite functions.
-      let mut secondary =
-        trailbase_extension::connect_sqlite(Some(path.clone()), Some(json_registry.clone()))?;
+      let mut secondary = build_connection(Some(path.clone()), json_registry.clone(), &runtimes)?;
 
-      #[cfg(any(feature = "geos", feature = "geos-static"))]
-      litegis::register(&secondary).map_err(trailbase_extension::Error::Rusqlite)?;
-
-      // Apply migrations. Extensions need to be loaded before to satisfy potential
-      // dependencies.
+      // Apply migrations.
+      //
+      // IMPORTANT: All extensions need to be loaded before to satisfy potential dependencies.
       apply_base_migrations(&mut secondary, Some(migrations_path), schema_name)?;
     }
 

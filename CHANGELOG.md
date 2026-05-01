@@ -2,9 +2,11 @@
 
 - Add two new SQL connection types: a postgres one and a polymorphic one with runtime dispatch.
   - This is mostly a proof-of-concept. Tests pass with the polymorphic connection pointing at SQLite but using postgres entails many more challenges:
-    - Different SQL dialects.
-    - Schema extraction missing.
-    - Change notifications for RecordApi subscriptions work very differently.
+    - different SQL dialects,
+    - schema extraction missing,
+    - dependencies on SQLite extensions for `CHECK()`, migrations, etc.,
+    - change notifications for RecordApi subscriptions would need to work very differently,
+    - more fun surprises...?
 - Introduce a new `AsyncReactive` + snapshot primitive to further entangle DB connection establishment from the execution model, i.e. allow establishing connection asynchronously and thus `RecordApi`s.
 - Update dependencies.
 
