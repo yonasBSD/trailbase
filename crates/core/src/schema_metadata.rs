@@ -6,7 +6,7 @@ use thiserror::Error;
 use trailbase_extension::jsonschema::JsonSchemaRegistry;
 use trailbase_schema::parse::parse_into_statement;
 use trailbase_schema::sqlite::{Table, View};
-use trailbase_sqlite::params;
+use trailbase_sqlite::{params, unpack_other_error};
 
 pub use trailbase_schema::metadata::{
   ConnectionMetadata, JsonColumnMetadata, JsonSchemaError, TableMetadata,
@@ -16,54 +16,57 @@ use crate::constants::SQLITE_SCHEMA_TABLE;
 
 #[derive(Debug, Error)]
 pub enum SchemaLookupError {
-  #[error("TB SQLite error: {0}")]
+  #[error("SqlError: {0}")]
   Sql(#[from] trailbase_sqlite::Error),
-  #[error("Rusqlite error: {0}")]
-  Rusqlite(#[from] rusqlite::Error),
-  #[error("Rusqlite error: {0}")]
-  FromSql2(#[from] rusqlite::types::FromSqlError),
-  #[error("Rusqlite error: {0}")]
+  #[error("FromSqlError: {0}")]
   FromSql(#[from] trailbase_sqlite::from_sql::FromSqlError),
-  #[error("Schema error: {0}")]
+  #[error("SchemaError: {0}")]
   Schema(#[from] trailbase_schema::sqlite::SchemaError),
-  #[error("Missing")]
-  Missing,
-  #[error("Sql parse error: {0}")]
+  #[error("InvalidSqlStatement")]
+  InvalidSqlStatement,
+  #[error("QueryReturnedNoRows")]
+  QueryReturnedNoRows,
+  #[error("SqlParseError: {0}")]
   SqlParse(#[from] sqlite3_parser::lexer::sql::Error),
-  #[error("Json Schema: {0}")]
+  #[error("JsonSchemaError: {0}")]
   JsonSchema(#[from] trailbase_schema::metadata::JsonSchemaError),
-  #[error("Other error: {0}")]
-  Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
-pub(crate) fn build_metadata_sync(
-  conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
-  json_schema_registry: &Arc<RwLock<trailbase_schema::registry::JsonSchemaRegistry>>,
-) -> Result<ConnectionMetadata, SchemaLookupError> {
-  let tables = lookup_and_parse_all_table_schemas_sync(conn)?;
-  let views = lookup_and_parse_all_view_schemas_sync(conn, &tables)?;
-
-  return build_connection_metadata_and_install_file_deletion_triggers_sync(
-    conn,
-    tables,
-    views,
-    json_schema_registry,
-  );
-}
-
-pub(crate) async fn build_metadata_async(
+pub(crate) async fn build_metadata(
   conn: &trailbase_sqlite::Connection,
   json_schema_registry: &Arc<RwLock<trailbase_schema::registry::JsonSchemaRegistry>>,
 ) -> Result<ConnectionMetadata, SchemaLookupError> {
   let json_schema_registry = json_schema_registry.clone();
-  return Ok(
-    conn
-      .call_writer(move |mut conn| {
-        build_metadata_sync(&mut conn, &json_schema_registry)
-          .map_err(|err| trailbase_sqlite::Error::Other(err.into()))
-      })
-      .await?,
-  );
+
+  return conn
+    .call_writer(move |mut conn| -> Result<_, trailbase_sqlite::Error> {
+      // Nested impl just for packaging error.
+      fn build_metadata_impl(
+        conn: &mut trailbase_sqlite::SyncConnection,
+        json_schema_registry: &Arc<RwLock<trailbase_schema::registry::JsonSchemaRegistry>>,
+      ) -> Result<ConnectionMetadata, SchemaLookupError> {
+        let tables = lookup_and_parse_all_table_schemas(conn)?;
+        let views = lookup_and_parse_all_view_schemas(conn, &tables)?;
+
+        return build_connection_metadata_and_install_file_deletion_triggers(
+          conn,
+          tables,
+          views,
+          json_schema_registry,
+        );
+      }
+
+      return build_metadata_impl(&mut conn, &json_schema_registry)
+        .map_err(|err| trailbase_sqlite::Error::Other(err.into()));
+    })
+    .await
+    .map_err(|err| {
+      // Unpack potentially packed SchemaLookupErrors.
+      return match unpack_other_error::<SchemaLookupError>(err) {
+        Ok(schema_lookup_err) => schema_lookup_err,
+        Err(sql_err) => sql_err.into(),
+      };
+    });
 }
 
 pub async fn lookup_and_parse_table_schema(
@@ -82,10 +85,10 @@ pub async fn lookup_and_parse_table_schema(
       0,
     )
     .await?
-    .ok_or_else(|| trailbase_sqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows))?;
+    .ok_or(SchemaLookupError::QueryReturnedNoRows)?;
 
   let Some(stmt) = parse_into_statement(&sql)? else {
-    return Err(SchemaLookupError::Missing);
+    return Err(SchemaLookupError::InvalidSqlStatement);
   };
 
   let mut table: Table = stmt.try_into()?;
@@ -101,7 +104,7 @@ pub async fn lookup_and_parse_table_schema(
 /// Tying the construction of schema metadata and the (re-)installing of file deletion triggers so
 /// closely together is a necessary evil. For example, whenever a schema changes, e.g. a new file
 /// column is added, we need to rebuild the metadata and update or install missing triggers.
-fn build_connection_metadata_and_install_file_deletion_triggers_sync(
+fn build_connection_metadata_and_install_file_deletion_triggers(
   conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
   tables: Vec<Table>,
   views: Vec<View>,
@@ -109,14 +112,14 @@ fn build_connection_metadata_and_install_file_deletion_triggers_sync(
 ) -> Result<ConnectionMetadata, SchemaLookupError> {
   let metadata = ConnectionMetadata::from_schemas(tables, views, &registry.read())?;
 
-  setup_file_deletion_triggers_sync(conn, &metadata)?;
+  setup_file_deletion_triggers(conn, &metadata)?;
 
   return Ok(metadata);
 }
 
 // Install file column triggers. This ain't pretty, this might be better on construction and
 // schema changes.
-fn setup_file_deletion_triggers_sync(
+fn setup_file_deletion_triggers(
   conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
   metadata: &ConnectionMetadata,
 ) -> Result<(), trailbase_sqlite::Error> {
@@ -163,7 +166,7 @@ fn setup_file_deletion_triggers_sync(
   return Ok(());
 }
 
-fn lookup_and_parse_all_table_schemas_sync(
+fn lookup_and_parse_all_table_schemas(
   conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
 ) -> Result<Vec<Table>, SchemaLookupError> {
   let databases = list_databases(conn)?;
@@ -178,7 +181,7 @@ fn lookup_and_parse_all_table_schemas_sync(
     for row in conn.query_rows(&query, ())? {
       let sql: String = row.get(0)?;
       let Some(stmt) = parse_into_statement(&sql)? else {
-        return Err(SchemaLookupError::Missing);
+        return Err(SchemaLookupError::InvalidSqlStatement);
       };
       tables.push({
         let mut table: Table = stmt.try_into()?;
@@ -191,7 +194,7 @@ fn lookup_and_parse_all_table_schemas_sync(
   return Ok(tables);
 }
 
-fn lookup_and_parse_all_view_schemas_sync(
+fn lookup_and_parse_all_view_schemas(
   conn: &mut impl trailbase_sqlite::SyncConnectionTrait,
   tables: &[Table],
 ) -> Result<Vec<View>, SchemaLookupError> {
@@ -225,12 +228,12 @@ fn lookup_and_parse_all_view_schemas_sync(
 fn sqlite3_parse_view(sql: &str, tables: &[Table]) -> Result<View, SchemaLookupError> {
   let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
   match parser.next()? {
-    None => Err(SchemaLookupError::Missing),
+    None => Err(SchemaLookupError::InvalidSqlStatement),
     Some(cmd) => {
       use sqlite3_parser::ast::Cmd;
       match cmd {
         Cmd::Stmt(stmt) => Ok(View::from(stmt, tables)?),
-        Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => Err(SchemaLookupError::Missing),
+        Cmd::Explain(_) | Cmd::ExplainQueryPlan(_) => Err(SchemaLookupError::InvalidSqlStatement),
       }
     }
   }

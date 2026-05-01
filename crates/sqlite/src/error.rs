@@ -38,3 +38,14 @@ pub enum Error {
   #[error("Other: {0}")]
   Other(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
+
+pub fn unpack_other_error<T>(err: Error) -> Result<T, Error>
+where
+  T: std::error::Error + Send + Sync + 'static,
+{
+  return match err {
+    // Try to downcast and otherwise repackage.
+    Error::Other(err) => Ok(*err.downcast::<T>().map_err(Error::Other)?),
+    err => Err(err),
+  };
+}

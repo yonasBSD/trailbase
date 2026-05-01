@@ -29,7 +29,7 @@ use crate::traits::{
 pub use crate::sqlite::executor::{ArcLockGuard, LockError, LockGuard};
 
 #[derive(Clone)]
-pub enum Executor {
+enum Executor {
   Sqlite(SqliteExecutor),
   Pg(PgExecutor),
 }
@@ -44,14 +44,14 @@ pub struct Connection {
 
 #[allow(unused)]
 impl Connection {
-  pub fn new(exec: Executor) -> Self {
+  fn new(exec: Executor) -> Self {
     return Self {
       id: UNIQUE_CONN_ID.fetch_add(1, Ordering::SeqCst),
       exec,
     };
   }
 
-  /// TODO: Should be renamed. Default to sqlite for POC.
+  /// TODO: Should be renamed. Default to sqlite for PoC.
   pub fn with_opts<E>(
     builder: impl Fn() -> Result<rusqlite::Connection, E>,
     opts: crate::sqlite::executor::Options,

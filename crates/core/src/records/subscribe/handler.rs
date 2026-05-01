@@ -408,7 +408,10 @@ pub async fn subscribe_ws(
         }
 
         let (sender, receiver) = async_channel::bounded::<EventCandidate>(64);
-        let conn_state = state.subscription_manager().get_per_connection_state(&api);
+        let conn_state = state
+          .subscription_manager()
+          .get_per_connection_state(&api)
+          .await;
 
         let Ok(subscription) = conn_state
           .clone()
@@ -446,7 +449,10 @@ pub async fn subscribe_ws(
         }
 
         let (sender, receiver) = async_channel::bounded::<EventCandidate>(64);
-        let conn_state = state.subscription_manager().get_per_connection_state(&api);
+        let conn_state = state
+          .subscription_manager()
+          .get_per_connection_state(&api)
+          .await;
 
         let Ok(subscription) = conn_state
           .clone()

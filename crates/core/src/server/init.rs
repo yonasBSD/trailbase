@@ -83,7 +83,8 @@ pub async fn init_app_state(args: InitArgs) -> Result<(bool, AppState), InitErro
     args.data_dir.clone(),
     json_schema_registry.clone(),
     sync_wasm_runtimes,
-  )?;
+  )
+  .await?;
 
   // Read config or write default one. Ensures config is validated.
   let config = load_or_init_config_textproto(&args.data_dir, &connection_manager).await?;

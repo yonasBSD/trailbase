@@ -288,7 +288,7 @@ impl AppState {
       .await
       .map_err(|err| {
         log::error!("Schema change invalidated config: {err}");
-        return crate::schema_metadata::SchemaLookupError::Other(err.into());
+        return err;
       })?;
 
     return Ok(());
@@ -535,7 +535,7 @@ pub async fn test_state(options: Option<TestStateOptions>) -> anyhow::Result<App
   let session_conn = crate::connection::init_session_db(None)?;
 
   let connection_manager =
-    ConnectionManager::new_for_test(data_dir.clone(), json_schema_registry.clone(), vec![]);
+    ConnectionManager::new_for_test(data_dir.clone(), json_schema_registry.clone(), vec![]).await;
 
   let object_store = if std::env::var("TEST_S3_OBJECT_STORE").map_or(false, |v| v == "TRUE") {
     info!("Use S3 Storage for tests");

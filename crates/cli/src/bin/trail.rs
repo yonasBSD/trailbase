@@ -97,8 +97,10 @@ async fn async_main(
             .url("/api/openapi.json", trailbase::openapi::Doc::openapi()),
         );
 
-        let listener = tokio::net::TcpListener::bind(addr.clone()).await.unwrap();
-        log::info!("docs @ http://{addr}/docs 🚀");
+        let listener = tokio::net::TcpListener::bind(address.clone())
+          .await
+          .unwrap();
+        log::info!("docs @ http://{address}/docs 🚀");
 
         axum::serve(listener, router).await.unwrap();
       }

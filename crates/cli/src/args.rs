@@ -130,7 +130,7 @@ pub struct ServerArgs {
   #[arg(long, default_value = "*")]
   pub cors_allowed_origins: Vec<String>,
 
-  /// Number of JavaScript isolates/workers to start (Default: #cpus).
+  /// Number of threads the WASM runtime uses (Default: #cpus).
   #[arg(long, env)]
   pub runtime_threads: Option<usize>,
 }
